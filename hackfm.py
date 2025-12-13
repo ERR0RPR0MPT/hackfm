@@ -49,10 +49,8 @@ class playlist_file_source(gr.sync_block):
         os.makedirs(self.temp_dir, exist_ok=True)
         self._clear_temp_dir()
         self.file_list = self._find_audio_files()
-
         if not self.file_list:
-            raise RuntimeError(f"No .wav or .mp3 files found in {self.dir_path}")
-
+            raise RuntimeError(f"No audio files found in {self.dir_path}")
         self.current_file_idx = 0
         self.current_file = None
         self.current_file_path = None
@@ -67,10 +65,12 @@ class playlist_file_source(gr.sync_block):
 
     def _find_audio_files(self):
         audio_files = []
+        # 添加更多支持的格式：.flac, .ogg, .mp3, .wav
+        valid_extensions = ('.wav', '.mp3', '.flac', '.ogg')
         for root, dirs, files in os.walk(self.dir_path):
             files = sorted(files)
             for file in files:
-                if file.lower().endswith('.wav') or file.lower().endswith('.mp3'):
+                if file.lower().endswith(valid_extensions):
                     audio_files.append(os.path.join(root, file))
         return audio_files
 
@@ -85,8 +85,10 @@ class playlist_file_source(gr.sync_block):
             return None, None, None
 
     def _needs_conversion(self, fname):
-        if fname.lower().endswith('.mp3'):
+        # 检查是否为非 WAV 格式 (MP3, FLAC, OGG 等)
+        if fname.lower().endswith(('.mp3', '.flac', '.ogg')):
             return True
+        
         sr, ch, sw = self._get_wav_info(fname)
         # 关键修复：除了检查采样率，还必须检查声道数
         # 如果不是 44100Hz 或者不是单声道(ch!=1)，则需要转换
@@ -98,6 +100,7 @@ class playlist_file_source(gr.sync_block):
         base = os.path.basename(source_path)
         name, _ext = os.path.splitext(base)
         temp_wav = os.path.join(self.temp_dir, f"{name}_{int(time.time()*1e6)%1000000}.wav")
+        
         cmd = [
             'ffmpeg', '-hide_banner', '-loglevel', 'error',
             '-y',
@@ -120,9 +123,10 @@ class playlist_file_source(gr.sync_block):
                 dtype = np.int16 if sample_width == 2 else None
                 if dtype is None:
                     return 32767  # 不支持其他类型，返回最大
-
+                
                 max_abs = 0
                 buffer_size = 4096 * channels
+                
                 while True:
                     data = w.readframes(buffer_size)
                     if not data:
@@ -141,13 +145,13 @@ class playlist_file_source(gr.sync_block):
         self._cleanup_old_temp()
         real_path = self.file_list[self.current_file_idx]
         
-        # 检查是否需要转换（MP3, 错误的采样率, 或立体声）
+        # 检查是否需要转换（MP3/FLAC/OGG, 错误的采样率, 或立体声）
         if self._needs_conversion(real_path):
             temp_wav = self._make_temp_wav(real_path)
             self.current_file_path = temp_wav
         else:
             self.current_file_path = real_path
-
+            
         self.current_file = open(self.current_file_path, 'rb')
         self.current_file.seek(44)
         print(f"Now playing: {real_path}")
@@ -229,10 +233,8 @@ class playlist_file_source(gr.sync_block):
         return super().stop()
 
 class FM_console(gr.top_block):
-
     def __init__(self, music_dir, freq, power):
         gr.top_block.__init__(self, "FM Playlist Transmitter", catch_exceptions=True)
-
         self.flowgraph_started = threading.Event()
 
         ##################################################
@@ -243,7 +245,7 @@ class FM_console(gr.top_block):
         # WFM带宽约 200kHz，原 88.2kHz 采样率严重不足，会导致混叠炸音。
         # 这里设为 44100 * 8 = 352800 Hz，足以容纳 WFM 频谱。
         self.target_quad_rate = 352800
-
+        
         self.rational_resampler_xxx_0 = filter.rational_resampler_ccc(
                 interpolation=2000000,
                 decimation=self.target_quad_rate, # 对应修改这里，保持匹配
@@ -283,8 +285,7 @@ class FM_console(gr.top_block):
         # 修复1: 大幅降低进入 FM 调制器的音量。
         # FM 调制包含预加重 (Pre-emphasis)，会大幅提升高频能量。
         # 如果输入接近 1.0，高频部分会严重超标，导致频偏过大和破音。
-        # 原值 0.00003 对应满幅，现调整为 0.000006 (约 -14dB)，为预加重留出余量。
-        self.blocks_multiply_const_vxx_0 = blocks.multiply_const_ff(0.000006) 
+        self.blocks_multiply_const_vxx_0 = blocks.multiply_const_ff(0.000006)
 
         # 使用 WFM 发送模块替换原有的 AM/IQ 注入方式
         # audio_rate: 44.1k
@@ -305,7 +306,6 @@ class FM_console(gr.top_block):
         self.connect((self.playlist_file_source_0, 0), (self.blocks_short_to_float_0, 0))
         self.connect((self.blocks_short_to_float_0, 0), (self.blocks_multiply_const_vxx_0, 0))
         self.connect((self.blocks_multiply_const_vxx_0, 0), (self.low_pass_filter_0, 0))
-
         # 新的 WFM 连接路径
         self.connect((self.low_pass_filter_0, 0), (self.analog_wfm_tx_0, 0))
         self.connect((self.analog_wfm_tx_0, 0), (self.rational_resampler_xxx_0, 0))
@@ -313,7 +313,7 @@ class FM_console(gr.top_block):
 
 def main(top_block_cls=FM_console, options=None):
     parser = ArgumentParser(description="FM Transmitter with GNU Radio Playlist")
-    parser.add_argument('-d', '--dir', type=str, required=True, help="Path to directory containing WAV/MP3 files")
+    parser.add_argument('-d', '--dir', type=str, required=True, help="Path to directory containing WAV/MP3/FLAC/OGG files")
     parser.add_argument('-f', '--frequency', type=int, required=True, help="Transmission frequency in Hz")
     parser.add_argument('-g', '--gain', type=int, required=True, help="Transmission power in dB")
     args = parser.parse_args()
@@ -330,12 +330,10 @@ def main(top_block_cls=FM_console, options=None):
 
     tb.start()
     tb.flowgraph_started.set()
-
     try:
         input('Press Enter to quit: ')
     except EOFError:
         pass
-
     tb.stop()
     tb.wait()
 
