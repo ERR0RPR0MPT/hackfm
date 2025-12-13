@@ -26,7 +26,6 @@ import wave
 import shutil
 import subprocess
 import tempfile
-import math  # 添加 math 库用于计算 FM 灵敏度
 
 class playlist_file_source(gr.sync_block):
     """
@@ -35,16 +34,12 @@ class playlist_file_source(gr.sync_block):
     Uses ./temp folder for transient data. Does not downmix or change bit depth.
     Loops through all files repeatedly if repeat=True.
     音频自动归一化到满幅（-1~1区间），避免响度太小或炸音
-    
-    [Update for Stereo]
-    Force conversion to 2 channels (Stereo). Outputs two streams (L, R).
     """
     def __init__(self, dir_path, repeat=True, dtype=np.int16, chunk_size=4096, target_headroom=0.98):
         gr.sync_block.__init__(self,
             name="playlist_file_source",
             in_sig=None,
-            # [Stereo] 输出两个 int16 端口：左声道，右声道
-            out_sig=[np.int16, np.int16])
+            out_sig=[np.int16])
         self.dir_path = dir_path
         self.repeat = repeat
         self.dtype = dtype
@@ -96,8 +91,8 @@ class playlist_file_source(gr.sync_block):
         
         sr, ch, sw = self._get_wav_info(fname)
         # 关键修复：除了检查采样率，还必须检查声道数
-        # [Stereo] 如果不是 44100Hz 或者不是双声道(ch!=2)，则需要转换
-        if sr != 44100 or ch != 2:
+        # 如果不是 44100Hz 或者不是单声道(ch!=1)，则需要转换
+        if sr != 44100 or ch != 1:
             return True
         return False
 
@@ -111,7 +106,7 @@ class playlist_file_source(gr.sync_block):
             '-y',
             '-i', source_path,
             '-ar', '44100',
-            '-ac', '2',  # 关键修复：[Stereo] 强制转换为双声道 (-ac 2)
+            '-ac', '1',  # 关键修复：强制转换为单声道 (-ac 1)
             temp_wav
         ]
         ret = subprocess.call(cmd)
@@ -150,7 +145,7 @@ class playlist_file_source(gr.sync_block):
         self._cleanup_old_temp()
         real_path = self.file_list[self.current_file_idx]
         
-        # 检查是否需要转换（MP3/FLAC/OGG, 错误的采样率, 或非立体声）
+        # 检查是否需要转换（MP3/FLAC/OGG, 错误的采样率, 或立体声）
         if self._needs_conversion(real_path):
             temp_wav = self._make_temp_wav(real_path)
             self.current_file_path = temp_wav
@@ -194,58 +189,38 @@ class playlist_file_source(gr.sync_block):
         self.open_current_file()
 
     def work(self, input_items, output_items):
-        out_l = output_items[0]
-        out_r = output_items[1]
-        
-        # 确保输出长度一致
-        n_out = min(len(out_l), len(out_r))
+        out = output_items[0]
         produced = 0
         
-        while produced < n_out:
+        while produced < len(out):
             if self.current_file is None:
-                out_l[produced:] = 0
-                out_r[produced:] = 0
+                out[produced:] = 0
                 return produced
             
-            # 每次读取 chunk_size 个 sample FRAMES (每个 frame 包含 2 个 int16)
-            to_read_frames = min((n_out - produced), self.chunk_size)
-            
-            # 乘以通道数 (2)
-            data = self.current_file.read(to_read_frames * 2 * np.dtype(self.dtype).itemsize)
+            to_read = min((len(out)-produced), self.chunk_size)
+            data = self.current_file.read(to_read * np.dtype(self.dtype).itemsize)
             samples = np.frombuffer(data, dtype=self.dtype)
             
             if len(samples) == 0:
                 self.next_file()
                 if self.current_file is None:
-                     out_l[produced:] = 0
-                     out_r[produced:] = 0
+                     out[produced:] = 0
                      return produced
                 continue
-            
-            # [Stereo] 归一化并分离声道
-            # Reshape 为 (-1, 2)
-            # 假如读取到的不是完整的帧（末尾），需要截断到偶数
-            if len(samples) % 2 != 0:
-                samples = samples[:-1]
-                
-            frame_count = len(samples) // 2
-            stereo_samples = samples.reshape(-1, 2)
-            
-            float_samples = stereo_samples.astype(np.float32) * self.current_gain
+
+            # 归一化提升响度，防炸音
+            float_samples = samples.astype(np.float32) * self.current_gain
+            # 限幅，防止极端取样溢出
             float_samples = np.clip(float_samples, -32767, 32767)
+            
             int_samples = float_samples.astype(self.dtype)
+            out[produced:produced+len(int_samples)] = int_samples
+            produced += len(int_samples)
             
-            # 写入输出端口
-            out_l[produced:produced+frame_count] = int_samples[:, 0]
-            out_r[produced:produced+frame_count] = int_samples[:, 1]
-            
-            produced += frame_count
-            
-            if frame_count < to_read_frames:
+            if len(samples) < to_read:
                 self.next_file()
                 if self.current_file is None:
-                    out_l[produced:] = 0
-                    out_r[produced:] = 0
+                    out[produced:] = 0
                     return produced
                     
         return produced
@@ -258,7 +233,6 @@ class playlist_file_source(gr.sync_block):
         return super().stop()
 
 class FM_console(gr.top_block):
-
     def __init__(self, music_dir, freq, power):
         gr.top_block.__init__(self, "FM Playlist Transmitter", catch_exceptions=True)
         self.flowgraph_started = threading.Event()
@@ -269,27 +243,18 @@ class FM_console(gr.top_block):
         
         # 修复2: 提升WFM的中间正交采样率(quad_rate)。
         # WFM带宽约 200kHz，原 88.2kHz 采样率严重不足，会导致混叠炸音。
-        # 这里设为 44100 * 8 = 352800 Hz，足以容纳 WFM 频谱 (或 MPX 频谱)。
-        self.audio_rate = 44100
+        # 这里设为 44100 * 8 = 352800 Hz，足以容纳 WFM 频谱。
         self.target_quad_rate = 352800
         
-        # [Stereo] 立体声参数
-        self.tau = 75e-6  # 预加重时间常数 (US: 75us, EU: 50us)
-        self.pilot_freq = 19000
-        self.subcarrier_freq = 38000
-        self.max_dev = 75000 # 75kHz 频偏
-
         self.rational_resampler_xxx_0 = filter.rational_resampler_ccc(
                 interpolation=2000000,
                 decimation=self.target_quad_rate, # 对应修改这里，保持匹配
                 taps=[],
                 fractional_bw=0)
 
-        # 替换 hack 为 hack
         self.osmosdr_sink_0 = osmosdr.sink(
             args="numchan=" + str(1) + " " + 'hackrf,bias_tx=0'
         )
-
         self.osmosdr_sink_0.set_time_unknown_pps(osmosdr.time_spec_t())
         self.osmosdr_sink_0.set_sample_rate(2000000)
         self.osmosdr_sink_0.set_center_freq(freq, 0)
@@ -304,110 +269,46 @@ class FM_console(gr.top_block):
         self.osmosdr_sink_0.set_antenna('', 0)
         self.osmosdr_sink_0.set_bandwidth(0, 0)
 
-        # [Stereo] 左声道 LPF
         # 调整低通滤波器，WFM 广播标准音频带宽通常为 15kHz
-        lpf_taps = firdes.low_pass(
+        self.low_pass_filter_0 = filter.fir_filter_fff(
+            1,
+            firdes.low_pass(
                 1,
                 44100,
                 15000,  # 5000 -> 15000 for WFM
                 1000,   # Widen transition for smoother rolloff
                 window.WIN_HAMMING,
-                6.76)
-        
-        self.low_pass_filter_left = filter.fir_filter_fff(1, lpf_taps)
-        # [Stereo] 右声道 LPF
-        self.low_pass_filter_right = filter.fir_filter_fff(1, lpf_taps)
+                6.76))
 
-        # [Stereo] 预加重 (Pre-emphasis)
-        # 修复：移除了导致崩溃的 firdes.fm_deemph 调用，直接使用 analog.fm_preemph
-        self.fm_preemph_left = analog.fm_preemph(self.audio_rate, self.tau)
-        self.fm_preemph_right = analog.fm_preemph(self.audio_rate, self.tau)
-
-        # [Stereo] 升采样 L/R 到 quad_rate (352.8k) 以便生成 MPX
-        self.resampler_left = filter.rational_resampler_fff(
-            interpolation=8, decimation=1)
-        self.resampler_right = filter.rational_resampler_fff(
-            interpolation=8, decimation=1)
-
-        self.blocks_short_to_float_l = blocks.short_to_float(1, 1)
-        self.blocks_short_to_float_r = blocks.short_to_float(1, 1)
+        self.blocks_short_to_float_0 = blocks.short_to_float(1, 1)
 
         # 修复1: 大幅降低进入 FM 调制器的音量。
         # FM 调制包含预加重 (Pre-emphasis)，会大幅提升高频能量。
         # 如果输入接近 1.0，高频部分会严重超标，导致频偏过大和破音。
-        # [Stereo] 这里保持原有增益，因为后续手动构建 MPX 仍需控制总幅度
-        gain_val = 0.000006
-        self.blocks_multiply_const_l = blocks.multiply_const_ff(gain_val)
-        self.blocks_multiply_const_r = blocks.multiply_const_ff(gain_val)
+        self.blocks_multiply_const_vxx_0 = blocks.multiply_const_ff(0.000006)
 
-        # [Stereo] MPX 编码组件
-        # 1. 矩阵
-        self.add_sum = blocks.add_ff(1) # L+R
-        self.sub_diff = blocks.sub_ff(1) # L-R
-        
-        # 2. 信号源
-        # Pilot 19kHz, amplitude 0.1 (10% modulation)
-        self.sig_pilot = analog.sig_source_f(self.target_quad_rate, analog.GR_SIN_WAVE, self.pilot_freq, 0.1, 0)
-        # Subcarrier 38kHz, amplitude 1.0 (carrier for DSB-SC)
-        self.sig_subcarrier = analog.sig_source_f(self.target_quad_rate, analog.GR_SIN_WAVE, self.subcarrier_freq, 1.0, 0)
-        
-        # 3. 调制 L-R
-        self.mul_mod = blocks.multiply_ff(1)
-        
-        # 4. 混合 MPX (Sum + Pilot + Modulated_Diff)
-        self.add_mpx = blocks.add_ff(1)
-        
-        # 5. FM Modulator
-        # Sensitivity = 2 * pi * max_dev / samp_rate
-        self.sensitivity = 2 * math.pi * self.max_dev / self.target_quad_rate
-        self.fm_mod = analog.frequency_modulator_fc(self.sensitivity)
+        # 使用 WFM 发送模块替换原有的 AM/IQ 注入方式
+        # audio_rate: 44.1k
+        # quad_rate: 352.8k (44.1k * 8) - 修复采样率问题
+        self.analog_wfm_tx_0 = analog.wfm_tx(
+            audio_rate=44100,
+            quad_rate=self.target_quad_rate,
+            tau=75e-6,
+            max_dev=75000,
+            # fh=-1.0, # Removed: fh argument is often not supported in standard wfm_tx python bindings
+        )
 
-        # 使用 WFM 发送模块替换原有的 AM/IQ 注入方式 -> [Stereo] 已替换为 MPX 链
-        
         self.playlist_file_source_0 = playlist_file_source(music_dir, repeat=True, chunk_size=4096)
 
         ##################################################
         # Connections
         ##################################################
-        # 1. 源 -> Float -> Gain
-        self.connect((self.playlist_file_source_0, 0), (self.blocks_short_to_float_l, 0))
-        self.connect((self.playlist_file_source_0, 1), (self.blocks_short_to_float_r, 0))
-        
-        self.connect((self.blocks_short_to_float_l, 0), (self.blocks_multiply_const_l, 0))
-        self.connect((self.blocks_short_to_float_r, 0), (self.blocks_multiply_const_r, 0))
-
-        # 2. Gain -> Pre-emphasis -> LPF (15k)
-        self.connect((self.blocks_multiply_const_l, 0), (self.fm_preemph_left, 0))
-        self.connect((self.blocks_multiply_const_r, 0), (self.fm_preemph_right, 0))
-        
-        self.connect((self.fm_preemph_left, 0), (self.low_pass_filter_left, 0))
-        self.connect((self.fm_preemph_right, 0), (self.low_pass_filter_right, 0))
-
-        # 3. LPF -> Resample (44.1k -> 352.8k)
-        self.connect((self.low_pass_filter_left, 0), (self.resampler_left, 0))
-        self.connect((self.low_pass_filter_right, 0), (self.resampler_right, 0))
-
-        # 4. Stereo Matrix (L+R, L-R)
-        self.connect((self.resampler_left, 0), (self.add_sum, 0))
-        self.connect((self.resampler_right, 0), (self.add_sum, 1)) # Sum = L+R
-        
-        self.connect((self.resampler_left, 0), (self.sub_diff, 0))
-        self.connect((self.resampler_right, 0), (self.sub_diff, 1)) # Diff = L-R
-
-        # 5. MPX Generation
-        # Modulate Diff: (L-R) * 38k
-        self.connect((self.sub_diff, 0), (self.mul_mod, 0))
-        self.connect((self.sig_subcarrier, 0), (self.mul_mod, 1))
-        
-        # Sum All: (L+R) + Pilot(19k) + Modulated_Diff
-        self.connect((self.add_sum, 0), (self.add_mpx, 0))
-        self.connect((self.sig_pilot, 0), (self.add_mpx, 1))
-        self.connect((self.mul_mod, 0), (self.add_mpx, 2))
-
-        # 6. FM Modulation -> Resample -> Sink
-        # 新的 WFM 连接路径 [Stereo]
-        self.connect((self.add_mpx, 0), (self.fm_mod, 0))
-        self.connect((self.fm_mod, 0), (self.rational_resampler_xxx_0, 0))
+        self.connect((self.playlist_file_source_0, 0), (self.blocks_short_to_float_0, 0))
+        self.connect((self.blocks_short_to_float_0, 0), (self.blocks_multiply_const_vxx_0, 0))
+        self.connect((self.blocks_multiply_const_vxx_0, 0), (self.low_pass_filter_0, 0))
+        # 新的 WFM 连接路径
+        self.connect((self.low_pass_filter_0, 0), (self.analog_wfm_tx_0, 0))
+        self.connect((self.analog_wfm_tx_0, 0), (self.rational_resampler_xxx_0, 0))
         self.connect((self.rational_resampler_xxx_0, 0), (self.osmosdr_sink_0, 0))
 
 def main(top_block_cls=FM_console, options=None):
@@ -429,12 +330,10 @@ def main(top_block_cls=FM_console, options=None):
 
     tb.start()
     tb.flowgraph_started.set()
-
     try:
         input('Press Enter to quit: ')
     except EOFError:
         pass
-
     tb.stop()
     tb.wait()
 
