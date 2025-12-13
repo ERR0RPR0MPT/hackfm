@@ -304,15 +304,26 @@ class FM_console(gr.top_block):
         self.osmosdr_sink_0.set_antenna('', 0)
         self.osmosdr_sink_0.set_bandwidth(0, 0)
 
+        # # [Stereo] 左声道 LPF
+        # # 调整低通滤波器，WFM 广播标准音频带宽通常为 15kHz
+        # lpf_taps = firdes.low_pass(
+        #         1,
+        #         44100,
+        #         15000,  # 5000 -> 15000 for WFM
+        #         1000,   # Widen transition for smoother rolloff
+        #         window.WIN_HAMMING,
+        #         6.76)
+
         # [Stereo] 左声道 LPF
         # 调整低通滤波器，WFM 广播标准音频带宽通常为 15kHz
         lpf_taps = firdes.low_pass(
                 1,
                 44100,
-                15000,  # 5000 -> 15000 for WFM
-                1000,   # Widen transition for smoother rolloff
+                22050,  # 5000 -> 22050 for WFM
+                # 15000,  # 5000 -> 15000 for WFM
+                10000,   # Widen transition for smoother rolloff
                 window.WIN_HAMMING,
-                6.76)
+                99999)
         
         self.low_pass_filter_left = filter.fir_filter_fff(1, lpf_taps)
         # [Stereo] 右声道 LPF
