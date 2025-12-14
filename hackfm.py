@@ -27,6 +27,804 @@ import shutil
 import subprocess
 import tempfile
 import math  # 添加 math 库用于计算 FM 灵敏度
+import sys
+import msvcrt  # Windows控制台输入
+from enum import Enum
+try:
+    from PyQt5.QtWidgets import *
+    from PyQt5.QtCore import *
+    from PyQt5.QtGui import *
+    PYQT5_AVAILABLE = True
+except ImportError:
+    PYQT5_AVAILABLE = False
+    print("PyQt5未安装，请运行: pip install PyQt5")
+
+class PlayMode(Enum):
+    SEQUENTIAL = "顺序播放"
+    SHUFFLE = "随机播放"
+    REPEAT_ONE = "单曲循环"
+
+class PlaybackController:
+    def __init__(self, playlist_source):
+        self.playlist_source = playlist_source
+        self.play_mode = PlayMode.SEQUENTIAL
+        self.paused = False
+        self.seek_offset = 0  # 跳转偏移量（秒）
+        self.current_file_pos = 0  # 当前文件播放位置（秒）
+        self.last_update_time = time.time()
+        
+    def set_play_mode(self, mode):
+        """设置播放模式"""
+        if isinstance(mode, PlayMode):
+            self.play_mode = mode
+        else:
+            # 字符串转换
+            mode_map = {
+                '1': PlayMode.SEQUENTIAL,
+                '2': PlayMode.SHUFFLE,
+                '3': PlayMode.REPEAT_ONE
+            }
+            if mode in mode_map:
+                self.play_mode = mode_map[mode]
+                
+        # 更新播放源的配置
+        if self.playlist_source:
+            if self.play_mode == PlayMode.SHUFFLE:
+                self.playlist_source.shuffle = True
+            else:
+                self.playlist_source.shuffle = False
+                
+    def toggle_pause(self):
+        """暂停/继续播放"""
+        self.paused = not self.paused
+        return self.paused
+        
+    def seek_forward(self, seconds=10):
+        """前进指定秒数"""
+        self.seek_offset += seconds
+        
+    def seek_backward(self, seconds=10):
+        """后退指定秒数"""
+        self.seek_offset -= seconds
+        if self.seek_offset < 0:
+            self.seek_offset = 0
+            
+    def next_track(self):
+        """下一曲"""
+        if self.playlist_source:
+            self.playlist_source.next_file()
+            self.seek_offset = 0
+            self.current_file_pos = 0
+            
+    def previous_track(self):
+        """上一曲"""
+        if self.playlist_source and len(self.playlist_source.file_list) > 0:
+            # 回到上一首或当前歌曲重新开始
+            if self.current_file_pos > 3:  # 如果播放超过3秒，重新开始当前歌曲
+                self.seek_offset = 0
+                self.current_file_pos = 0
+            else:  # 否则回到上一首
+                self.playlist_source.current_file_idx -= 2
+                if self.playlist_source.current_file_idx < -1:
+                    self.playlist_source.current_file_idx = len(self.playlist_source.file_list) - 2
+                self.playlist_source.next_file()
+                self.seek_offset = 0
+                self.current_file_pos = 0
+                
+    def update_position(self):
+        """更新播放位置"""
+        if not self.paused:
+            current_time = time.time()
+            time_diff = current_time - self.last_update_time
+            self.current_file_pos += time_diff
+            self.last_update_time = current_time
+            
+        # 处理跳转
+        if abs(self.seek_offset) > 0.1 and self.playlist_source and self.playlist_source.current_file:
+            try:
+                # 计算目标位置
+                current_pos = self.playlist_source.current_file.tell()
+                bytes_per_second = 44100 * 2 * 2  # 44100Hz, 2声道, 2字节/sample
+                target_pos = current_pos + int(self.seek_offset * bytes_per_second)
+                
+                # 确保位置在有效范围内
+                if target_pos >= 44:  # WAV文件头44字节
+                    self.playlist_source.current_file.seek(target_pos)
+                else:
+                    self.playlist_source.current_file.seek(44)
+                    
+                self.seek_offset = 0
+            except Exception:
+                pass  # 如果跳转失败，忽略
+                
+    def get_current_info(self):
+        """获取当前播放信息"""
+        if not self.playlist_source or not self.playlist_source.current_file:
+            return "无播放信息"
+            
+        current_file = self.playlist_source.current_file_path
+        if not current_file:
+            return "无播放信息"
+            
+        # 获取文件名
+        file_name = os.path.basename(current_file)
+        
+        # 获取播放位置
+        position = self.current_file_pos + self.seek_offset
+        if position < 0:
+            position = 0
+            
+        # 格式化时间
+        minutes = int(position // 60)
+        seconds = int(position % 60)
+        
+        # 获取播放模式
+        mode_text = self.play_mode.value
+        
+        # 获取状态
+        status = "暂停" if self.paused else "播放中"
+        
+        return f"[{status}] {file_name} | {minutes:02d}:{seconds:02d} | {mode_text}"
+
+class DisplayManager:
+    def __init__(self, controller):
+        self.controller = controller
+        self.running = True
+        self.display_thread = None
+        self.input_thread = None
+        
+    def start(self):
+        """启动显示和输入监控线程"""
+        self.display_thread = threading.Thread(target=self._display_loop, daemon=True)
+        self.input_thread = threading.Thread(target=self._input_loop, daemon=True)
+        
+        self.display_thread.start()
+        self.input_thread.start()
+        
+    def stop(self):
+        """停止所有线程"""
+        self.running = False
+        
+    def _display_loop(self):
+        """显示循环，每秒更新一次"""
+        while self.running:
+            try:
+                # 更新播放位置
+                self.controller.update_position()
+                
+                # 获取当前信息
+                info = self.controller.get_current_info()
+                
+                # 清空当前行并显示信息
+                print(f"\r{' ' * 100}\r{info}", end='', flush=True)
+                
+                time.sleep(1)  # 每秒更新一次
+                
+            except Exception as e:
+                print(f"\r显示错误: {e}", end='', flush=True)
+                time.sleep(1)
+                
+    def _input_loop(self):
+        """输入监控循环"""
+        print("\n\n播放控制命令:")
+        print("空格键 - 暂停/继续")
+        print("n - 下一曲")
+        print("p - 上一曲")
+        print("→ - 前进10秒")
+        print("← - 后退10秒")
+        print("1 - 顺序播放")
+        print("2 - 随机播放") 
+        print("3 - 单曲循环")
+        print("q - 退出")
+        print("-" * 50)
+        
+        while self.running:
+            try:
+                if msvcrt.kbhit():  # 检查是否有按键
+                    key = msvcrt.getch().decode('utf-8', errors='ignore').lower()
+                    
+                    if key == ' ':  # 空格键 - 暂停/继续
+                        paused = self.controller.toggle_pause()
+                        status = "已暂停" if paused else "继续播放"
+                        print(f"\r{status}", end='', flush=True)
+                        
+                    elif key == 'n':  # 下一曲
+                        self.controller.next_track()
+                        print(f"\r下一曲", end='', flush=True)
+                        
+                    elif key == 'p':  # 上一曲
+                        self.controller.previous_track()
+                        print(f"\r上一曲", end='', flush=True)
+                        
+                    elif key == '\xe0':  # 特殊键（方向键）
+                        # 读取第二个字节
+                        key2 = msvcrt.getch().decode('utf-8', errors='ignore')
+                        if key2 == 'M':  # 右箭头 - 前进
+                            self.controller.seek_forward()
+                            print(f"\r前进10秒", end='', flush=True)
+                        elif key2 == 'K':  # 左箭头 - 后退
+                            self.controller.seek_backward()
+                            print(f"\r后退10秒", end='', flush=True)
+                            
+                    elif key in ['1', '2', '3']:  # 播放模式
+                        mode_map = {'1': '顺序播放', '2': '随机播放', '3': '单曲循环'}
+                        self.controller.set_play_mode(key)
+                        print(f"\r切换到{mode_map[key]}", end='', flush=True)
+                        
+                    elif key == 'q':  # 退出
+                        print(f"\r正在退出...")
+                        self.running = False
+                        break
+                        
+                time.sleep(0.1)
+            except Exception as e:
+                print(f"\r输入错误: {e}", end='', flush=True)
+                
+
+class FMApplicationGUI(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("FM发射器控制面板")
+        self.setGeometry(100, 100, 800, 600)
+        
+        # FM发射器相关
+        self.fm_console = None
+        self.controller = None
+        self.is_playing = False
+        self.update_timer = None
+        
+        # 创建界面
+        self.create_widgets()
+        
+        # 设置窗口图标（如果有的话）
+        # self.setWindowIcon(QIcon('icon.png'))
+        
+    def create_widgets(self):
+        """创建界面组件"""
+        # 创建中央部件
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        
+        # 主布局
+        main_layout = QVBoxLayout(central_widget)
+        main_layout.setSpacing(10)
+        main_layout.setContentsMargins(10, 10, 10, 10)
+        
+        # 标题
+        title_label = QLabel("FM发射器控制面板")
+        title_label.setAlignment(Qt.AlignCenter)
+        title_font = QFont("微软雅黑", 16, QFont.Bold)
+        title_label.setFont(title_font)
+        main_layout.addWidget(title_label)
+        
+        # 主要内容区域 - 水平布局
+        content_layout = QHBoxLayout()
+        main_layout.addLayout(content_layout)
+        
+        # 左侧控制面板
+        control_group = QGroupBox("播放控制")
+        control_layout = QVBoxLayout(control_group)
+        
+        # 播放控制按钮
+        self.play_pause_btn = QPushButton("▶ 开始播放")
+        self.play_pause_btn.setFont(QFont("微软雅黑", 12, QFont.Bold))
+        self.play_pause_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                border: none;
+                padding: 10px;
+                border-radius: 5px;
+                min-width: 120px;
+            }
+            QPushButton:hover {
+                background-color: #45a049;
+            }
+            QPushButton:pressed {
+                background-color: #3d8b40;
+            }
+        """)
+        self.play_pause_btn.clicked.connect(self.toggle_play_pause)
+        control_layout.addWidget(self.play_pause_btn, alignment=Qt.AlignCenter)
+        
+        # 导航按钮
+        nav_layout = QHBoxLayout()
+        self.prev_btn = QPushButton("⏮ 上一曲")
+        self.prev_btn.setFont(QFont("微软雅黑", 10))
+        self.prev_btn.clicked.connect(self.previous_track)
+        nav_layout.addWidget(self.prev_btn)
+        
+        self.next_btn = QPushButton("⏭ 下一曲")
+        self.next_btn.setFont(QFont("微软雅黑", 10))
+        self.next_btn.clicked.connect(self.next_track)
+        nav_layout.addWidget(self.next_btn)
+        control_layout.addLayout(nav_layout)
+        
+        # 跳转按钮
+        seek_layout = QHBoxLayout()
+        self.seek_back_btn = QPushButton("⏪ 后退10秒")
+        self.seek_back_btn.setFont(QFont("微软雅黑", 10))
+        self.seek_back_btn.clicked.connect(self.seek_backward)
+        seek_layout.addWidget(self.seek_back_btn)
+        
+        self.seek_forward_btn = QPushButton("⏩ 前进10秒")
+        self.seek_forward_btn.setFont(QFont("微软雅黑", 10))
+        self.seek_forward_btn.clicked.connect(self.seek_forward)
+        seek_layout.addWidget(self.seek_forward_btn)
+        control_layout.addLayout(seek_layout)
+        
+        # 播放模式
+        mode_group = QGroupBox("播放模式")
+        mode_layout = QVBoxLayout(mode_group)
+        
+        self.play_mode_group = QButtonGroup()
+        self.mode_sequential = QRadioButton("顺序播放")
+        self.mode_sequential.setChecked(True)
+        self.mode_shuffle = QRadioButton("随机播放")
+        self.mode_repeat = QRadioButton("单曲循环")
+        
+        self.play_mode_group.addButton(self.mode_sequential, 1)
+        self.play_mode_group.addButton(self.mode_shuffle, 2)
+        self.play_mode_group.addButton(self.mode_repeat, 3)
+        
+        self.play_mode_group.buttonClicked.connect(self.change_play_mode)
+        
+        mode_layout.addWidget(self.mode_sequential)
+        mode_layout.addWidget(self.mode_shuffle)
+        mode_layout.addWidget(self.mode_repeat)
+        control_layout.addWidget(mode_group)
+        
+        # 参数设置
+        param_group = QGroupBox("发射参数")
+        param_layout = QFormLayout(param_group)
+        
+        self.freq_input = QLineEdit("100.0")
+        self.freq_input.setFont(QFont("微软雅黑", 10))
+        param_layout.addRow("频率 (MHz):", self.freq_input)
+        
+        self.power_input = QLineEdit("30")
+        self.power_input.setFont(QFont("微软雅黑", 10))
+        param_layout.addRow("功率 (dB):", self.power_input)
+        control_layout.addWidget(param_group)
+        
+        # 音乐目录
+        dir_group = QGroupBox("音乐目录")
+        dir_layout = QVBoxLayout(dir_group)
+        
+        self.dir_label = QLabel("未选择目录")
+        self.dir_label.setFont(QFont("微软雅黑", 10))
+        self.dir_label.setWordWrap(True)
+        dir_layout.addWidget(self.dir_label)
+        
+        self.browse_btn = QPushButton("📁 选择目录")
+        self.browse_btn.setFont(QFont("微软雅黑", 10))
+        self.browse_btn.clicked.connect(self.browse_directory)
+        dir_layout.addWidget(self.browse_btn)
+        control_layout.addWidget(dir_group)
+        
+        # 添加弹簧
+        control_layout.addStretch()
+        content_layout.addWidget(control_group)
+        
+        # 右侧信息显示
+        info_group = QGroupBox("播放信息")
+        info_layout = QVBoxLayout(info_group)
+        
+        # 当前播放信息
+        self.current_song_label = QLabel("当前无播放")
+        self.current_song_label.setFont(QFont("微软雅黑", 12, QFont.Bold))
+        self.current_song_label.setWordWrap(True)
+        info_layout.addWidget(self.current_song_label)
+        
+        self.time_label = QLabel("时间: 00:00")
+        self.time_label.setFont(QFont("微软雅黑", 10))
+        info_layout.addWidget(self.time_label)
+        
+        self.mode_label = QLabel("模式: 顺序播放")
+        self.mode_label.setFont(QFont("微软雅黑", 10))
+        info_layout.addWidget(self.mode_label)
+        
+        self.status_label = QLabel("状态: 停止")
+        self.status_label.setFont(QFont("微软雅黑", 10))
+        info_layout.addWidget(self.status_label)
+        
+        # 播放列表
+        playlist_group = QGroupBox("播放列表")
+        playlist_layout = QVBoxLayout(playlist_group)
+        
+        self.playlist_widget = QListWidget()
+        self.playlist_widget.setFont(QFont("微软雅黑", 10))
+        playlist_layout.addWidget(self.playlist_widget)
+        
+        info_layout.addWidget(playlist_group)
+        content_layout.addWidget(info_group)
+        
+        # 状态栏
+        self.status_bar = QStatusBar()
+        self.setStatusBar(self.status_bar)
+        self.status_bar.showMessage("就绪")
+         
+    def browse_directory(self):
+        """浏览音乐目录"""
+        directory = QFileDialog.getExistingDirectory(self, "选择音乐目录")
+        if directory:
+            self.dir_entry.setText(directory)
+            self.update_playlist_display(directory)
+            
+    def update_playlist_display(self, directory):
+        """更新播放列表显示"""
+        self.playlist_widget.clear()
+        try:
+            # 查找音频文件
+            audio_files = []
+            valid_extensions = ('.wav', '.mp3', '.flac', '.ogg')
+            for root, dirs, files in os.walk(directory):
+                files = sorted(files)
+                for file in files:
+                    if file.lower().endswith(valid_extensions):
+                        audio_files.append(file)
+                        
+            # 添加到列表框
+            for file in audio_files:
+                self.playlist_widget.addItem(file)
+                
+            self.status_bar.showMessage(f"找到 {len(audio_files)} 个音频文件")
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"读取目录失败: {str(e)}")
+            
+    def toggle_play_pause(self):
+        """切换播放/暂停状态"""
+        if not self.dir_entry.text() or self.dir_entry.text() == "":
+            QMessageBox.warning(self, "警告", "请先选择音乐目录")
+            return
+            
+        try:
+            if not self.is_playing:
+                self.start_playback()
+            else:
+                self.pause_playback()
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"播放控制失败: {str(e)}")
+            
+    def start_playback(self):
+        """开始播放"""
+        # 获取参数
+        freq_mhz = float(self.freq_entry.text())
+        power_db = int(self.power_entry.text())
+        directory = self.dir_entry.text()
+        
+        # 转换为Hz
+        freq_hz = int(freq_mhz * 1e6)
+        
+        # 创建FM发射器
+        self.fm_console = FM_console(music_dir=directory, freq=freq_hz, power=power_db)
+        self.controller = self.fm_console.controller
+        
+        # 启动发射器
+        self.fm_console.start()
+        self.fm_console.flowgraph_started.set()
+        
+        self.is_playing = True
+        self.play_pause_btn.setText("⏸ 暂停播放")
+        self.status_bar.showMessage("正在播放")
+        
+        # 开始更新显示
+        self.update_display()
+        
+    def pause_playback(self):
+        """暂停播放"""
+        if self.controller:
+            self.controller.toggle_pause()
+            if self.controller.paused:
+                self.play_pause_btn.setText("▶ 继续播放")
+                self.status_bar.showMessage("已暂停")
+            else:
+                self.play_pause_btn.setText("⏸ 暂停播放")
+                self.status_bar.showMessage("正在播放")
+                
+    def stop_playback(self):
+        """停止播放"""
+        if self.fm_console:
+            self.fm_console.stop()
+            self.fm_console.wait()
+            self.fm_console = None
+            self.controller = None
+            
+        self.is_playing = False
+        self.play_pause_btn.setText("▶ 开始播放")
+        self.status_bar.showMessage("已停止")
+        self.current_song_label.setText("当前无播放")
+        self.time_label.setText("时间: 00:00")
+        
+        # 停止更新定时器
+        if self.update_timer:
+            self.update_timer.stop()
+            
+    def next_track(self):
+        """下一曲"""
+        if self.controller:
+            self.controller.next_track()
+            self.status_bar.showMessage("切换到下一曲")
+            
+    def previous_track(self):
+        """上一曲"""
+        if self.controller:
+            self.controller.previous_track()
+            self.status_bar.showMessage("切换到上一曲")
+            
+    def seek_forward(self):
+        """前进10秒"""
+        if self.controller:
+            self.controller.seek_forward()
+            self.status_bar.showMessage("前进10秒")
+            
+    def seek_backward(self):
+        """后退10秒"""
+        if self.controller:
+            self.controller.seek_backward()
+            self.status_bar.showMessage("后退10秒")
+            
+    def change_play_mode(self):
+        """改变播放模式"""
+        if self.controller:
+            if self.seq_radio.isChecked():
+                mode = "1"
+                mode_text = "顺序播放"
+            elif self.shuffle_radio.isChecked():
+                mode = "2"
+                mode_text = "随机播放"
+            elif self.repeat_radio.isChecked():
+                mode = "3"
+                mode_text = "单曲循环"
+            else:
+                return
+                
+            self.controller.set_play_mode(mode)
+            self.status_bar.showMessage(f"切换到{mode_text}")
+            
+    def update_display(self):
+        """更新显示信息"""
+        if self.controller and self.is_playing:
+            try:
+                # 更新播放位置
+                self.controller.update_position()
+                
+                # 获取当前信息
+                info = self.controller.get_current_info()
+                
+                # 解析信息
+                if "无播放信息" not in info:
+                    # 提取文件名
+                    if "]" in info and "|" in info:
+                        parts = info.split("|")
+                        if len(parts) >= 2:
+                            status_file = parts[0].strip()
+                            time_part = parts[1].strip()
+                            mode_part = parts[2].strip() if len(parts) > 2 else ""
+                            
+                            # 提取文件名
+                            if "]" in status_file:
+                                file_name = status_file.split("]")[1].strip()
+                                self.current_song_label.setText(file_name)
+                            
+                            # 更新时间
+                            self.time_label.setText(f"时间: {time_part}")
+                            
+                            # 更新模式
+                            self.mode_label.setText(f"模式: {mode_part}")
+                            
+                            # 更新状态
+                            if "暂停" in status_file:
+                                self.status_label.setText("状态: 暂停")
+                            else:
+                                self.status_label.setText("状态: 播放中")
+                
+                # 继续更新
+                self.update_timer = QTimer()
+                self.update_timer.timeout.connect(self.update_display)
+                self.update_timer.start(1000)  # 1秒更新一次
+                
+            except Exception as e:
+                self.status_bar.showMessage(f"更新显示错误: {str(e)}")
+                self.update_timer = QTimer()
+                self.update_timer.timeout.connect(self.update_display)
+                self.update_timer.start(1000)  # 1秒更新一次
+        
+    def closeEvent(self, event):
+        """窗口关闭事件处理"""
+        if self.is_playing:
+            reply = QMessageBox.question(self, '退出', '正在播放中，确定要退出吗？',
+                                       QMessageBox.Yes | QMessageBox.No,
+                                       QMessageBox.No)
+            if reply == QMessageBox.Yes:
+                self.stop_playback()
+                event.accept()
+            else:
+                event.ignore()
+        else:
+            event.accept()
+            
+    def run(self):
+        """运行GUI应用"""
+        self.show()  # 显示窗口
+        # 注意：PyQt5的事件循环将在主程序的app.exec_()中运行
+        
+    def create_widgets(self):
+        """创建界面组件"""
+        # 创建中央部件
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        
+        # 主布局
+        main_layout = QVBoxLayout(central_widget)
+        main_layout.setSpacing(10)
+        main_layout.setContentsMargins(10, 10, 10, 10)
+        
+        # 标题
+        title_label = QLabel("FM发射器控制面板")
+        title_label.setAlignment(Qt.AlignCenter)
+        title_font = QFont("微软雅黑", 16, QFont.Bold)
+        title_label.setFont(title_font)
+        main_layout.addWidget(title_label)
+        
+        # 主要内容区域 - 水平布局
+        content_layout = QHBoxLayout()
+        main_layout.addLayout(content_layout)
+        
+        # 左侧控制面板
+        control_group = QGroupBox("播放控制")
+        control_layout = QVBoxLayout(control_group)
+        
+        # 播放控制按钮
+        self.play_pause_btn = QPushButton("▶ 开始播放")
+        self.play_pause_btn.setFont(QFont("微软雅黑", 12, QFont.Bold))
+        self.play_pause_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                border: none;
+                padding: 10px;
+                border-radius: 5px;
+                min-width: 120px;
+            }
+            QPushButton:hover {
+                background-color: #45a049;
+            }
+            QPushButton:pressed {
+                background-color: #3d8b40;
+            }
+        """)
+        self.play_pause_btn.clicked.connect(self.toggle_play_pause)
+        control_layout.addWidget(self.play_pause_btn, alignment=Qt.AlignCenter)
+        
+        # 导航按钮（上一曲/下一曲）
+        nav_layout = QHBoxLayout()
+        self.prev_btn = QPushButton("⏮ 上一曲")
+        self.prev_btn.setFont(QFont("微软雅黑", 10))
+        self.prev_btn.clicked.connect(self.previous_track)
+        nav_layout.addWidget(self.prev_btn)
+        
+        self.next_btn = QPushButton("⏭ 下一曲")
+        self.next_btn.setFont(QFont("微软雅黑", 10))
+        self.next_btn.clicked.connect(self.next_track)
+        nav_layout.addWidget(self.next_btn)
+        control_layout.addLayout(nav_layout)
+        
+        # 跳转按钮（前进/后退）
+        seek_layout = QHBoxLayout()
+        self.seek_back_btn = QPushButton("⏪ 后退10秒")
+        self.seek_back_btn.setFont(QFont("微软雅黑", 10))
+        self.seek_back_btn.clicked.connect(self.seek_backward)
+        seek_layout.addWidget(self.seek_back_btn)
+        
+        self.seek_forward_btn = QPushButton("⏩ 前进10秒")
+        self.seek_forward_btn.setFont(QFont("微软雅黑", 10))
+        self.seek_forward_btn.clicked.connect(self.seek_forward)
+        seek_layout.addWidget(self.seek_forward_btn)
+        control_layout.addLayout(seek_layout)
+        
+        # 播放模式选择
+        mode_group = QGroupBox("播放模式")
+        mode_layout = QVBoxLayout(mode_group)
+        
+        self.play_mode_var = "1"  # 默认顺序播放
+        
+        self.seq_radio = QRadioButton("顺序播放")
+        self.seq_radio.setChecked(True)
+        self.seq_radio.clicked.connect(lambda: self.change_play_mode())
+        mode_layout.addWidget(self.seq_radio)
+        
+        self.shuffle_radio = QRadioButton("随机播放")
+        self.shuffle_radio.clicked.connect(lambda: self.change_play_mode())
+        mode_layout.addWidget(self.shuffle_radio)
+        
+        self.repeat_radio = QRadioButton("单曲循环")
+        self.repeat_radio.clicked.connect(lambda: self.change_play_mode())
+        mode_layout.addWidget(self.repeat_radio)
+        
+        control_layout.addWidget(mode_group)
+        
+        # 发射参数设置
+        param_group = QGroupBox("发射参数")
+        param_layout = QFormLayout(param_group)
+        
+        self.freq_var = "100.0"
+        self.power_var = "30"
+        
+        self.freq_entry = QLineEdit(self.freq_var)
+        self.freq_entry.setMaximumWidth(100)
+        param_layout.addRow("频率 (MHz):", self.freq_entry)
+        
+        self.power_entry = QLineEdit(self.power_var)
+        self.power_entry.setMaximumWidth(100)
+        param_layout.addRow("功率 (dB):", self.power_entry)
+        
+        control_layout.addWidget(param_group)
+        
+        # 音乐目录选择
+        dir_group = QGroupBox("音乐目录")
+        dir_layout = QVBoxLayout(dir_group)
+        
+        self.dir_var = ""
+        self.dir_entry = QLineEdit(self.dir_var)
+        self.dir_entry.setReadOnly(True)
+        dir_layout.addWidget(self.dir_entry)
+        
+        self.browse_btn = QPushButton("📁 选择目录")
+        self.browse_btn.setFont(QFont("微软雅黑", 10))
+        self.browse_btn.clicked.connect(self.browse_directory)
+        dir_layout.addWidget(self.browse_btn)
+        
+        control_layout.addWidget(dir_group)
+        
+        # 添加弹簧使控件向上对齐
+        control_layout.addStretch()
+        
+        content_layout.addWidget(control_group)
+        
+        # 右侧信息显示区域
+        right_panel = QVBoxLayout()
+        
+        # 播放信息组
+        info_group = QGroupBox("播放信息")
+        info_layout = QVBoxLayout(info_group)
+        
+        self.current_song_label = QLabel("当前无播放")
+        self.current_song_label.setFont(QFont("微软雅黑", 12, QFont.Bold))
+        self.current_song_label.setWordWrap(True)
+        info_layout.addWidget(self.current_song_label)
+        
+        self.time_label = QLabel("时间: 00:00")
+        self.time_label.setFont(QFont("微软雅黑", 10))
+        info_layout.addWidget(self.time_label)
+        
+        self.mode_label = QLabel("模式: 顺序播放")
+        self.mode_label.setFont(QFont("微软雅黑", 10))
+        info_layout.addWidget(self.mode_label)
+        
+        self.status_label = QLabel("状态: 停止")
+        self.status_label.setFont(QFont("微软雅黑", 10))
+        info_layout.addWidget(self.status_label)
+        
+        right_panel.addWidget(info_group)
+        
+        # 播放列表组
+        playlist_group = QGroupBox("播放列表")
+        playlist_layout = QVBoxLayout(playlist_group)
+        
+        self.playlist_widget = QListWidget()
+        self.playlist_widget.setMaximumHeight(200)
+        playlist_layout.addWidget(self.playlist_widget)
+        
+        right_panel.addWidget(playlist_group)
+        
+        content_layout.addLayout(right_panel)
+        
+        # 状态栏
+        self.status_bar = QStatusBar()
+        self.setStatusBar(self.status_bar)
+        self.status_bar.showMessage("就绪")
+
 
 class playlist_file_source(gr.sync_block):
     """
@@ -239,6 +1037,13 @@ class playlist_file_source(gr.sync_block):
                 out_r[produced:] = 0
                 return produced
             
+            # 检查是否暂停（通过外部控制器）
+            if hasattr(self, 'controller') and self.controller and self.controller.paused:
+                # 暂停时输出静音
+                out_l[produced:] = 0
+                out_r[produced:] = 0
+                return produced
+            
             # 每次读取 chunk_size 个 sample FRAMES (每个 frame 包含 2 个 int16)
             to_read_frames = min((n_out - produced), self.chunk_size)
             
@@ -295,6 +1100,8 @@ class FM_console(gr.top_block):
         gr.top_block.__init__(self, "FM Playlist Transmitter", catch_exceptions=True)
         self.flowgraph_started = threading.Event()
         self.shuffle = shuffle
+        self.controller = None  # 播放控制器
+        self.display_manager = None  # 显示管理器
 
         ##################################################
         # Blocks
@@ -398,6 +1205,13 @@ class FM_console(gr.top_block):
         # 使用 WFM 发送模块替换原有的 AM/IQ 注入方式 -> [Stereo] 已替换为 MPX 链
         
         self.playlist_file_source_0 = playlist_file_source(music_dir, repeat=True, chunk_size=4096, shuffle=self.shuffle)
+        
+        # 创建播放控制器和显示管理器
+        self.controller = PlaybackController(self.playlist_file_source_0)
+        self.display_manager = DisplayManager(self.controller)
+        
+        # 将控制器关联到播放源
+        self.playlist_file_source_0.controller = self.controller
 
         ##################################################
         # Connections
@@ -449,11 +1263,14 @@ def main(top_block_cls=FM_console, options=None):
     parser.add_argument('-f', '--frequency', type=int, required=True, help="Transmission frequency in Hz")
     parser.add_argument('-g', '--gain', type=int, required=True, help="Transmission power in dB")
     parser.add_argument('-s', '--shuffle', action='store_true', help="Enable shuffle mode for random playback")
+    parser.add_argument('--gui', action='store_true', help="Enable GUI mode")
     args = parser.parse_args()
 
     tb = top_block_cls(music_dir=args.dir, freq=args.frequency, power=args.gain, shuffle=args.shuffle)
 
     def sig_handler(sig=None, frame=None):
+        if tb.display_manager:
+            tb.display_manager.stop()
         tb.stop()
         tb.wait()
         sys.exit(0)
@@ -463,14 +1280,56 @@ def main(top_block_cls=FM_console, options=None):
 
     tb.start()
     tb.flowgraph_started.set()
+    
+    # 如果启用GUI模式
+    if args.gui:
+        app = QApplication(sys.argv)
+        gui = FMApplicationGUI()
+        
+        # 连接FM控制台到GUI
+        gui.fm_console = tb
+        gui.controller = tb.controller
+        
+        # 设置GUI的播放控制器
+        if tb.controller:
+            tb.controller.gui = gui
+        
+        # 运行GUI
+        gui.run()
+        
+        # PyQt5事件循环
+        try:
+            sys.exit(app.exec_())
+        except KeyboardInterrupt:
+            pass
+        finally:
+            # 清理退出
+            if tb.display_manager:
+                tb.display_manager.stop()
+            tb.stop()
+            tb.wait()
+    else:
+        # 启动显示管理器（终端模式）
+        if tb.display_manager:
+            tb.display_manager.start()
 
-    try:
-        input('Press Enter to quit: ')
-    except EOFError:
-        pass
+        try:
+            # 等待显示管理器停止（用户按q键退出）
+            if tb.display_manager:
+                while tb.display_manager.running:
+                    time.sleep(0.5)
+            else:
+                input('Press Enter to quit: ')
+        except KeyboardInterrupt:
+            pass
+        except EOFError:
+            pass
 
-    tb.stop()
-    tb.wait()
+        # 清理退出
+        if tb.display_manager:
+            tb.display_manager.stop()
+        tb.stop()
+        tb.wait()
 
 if __name__ == '__main__':
     main()
