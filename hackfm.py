@@ -39,7 +39,7 @@ class playlist_file_source(gr.sync_block):
     [Update for Stereo]
     Force conversion to 2 channels (Stereo). Outputs two streams (L, R).
     """
-    def __init__(self, dir_path, repeat=True, dtype=np.int16, chunk_size=4096, target_headroom=0.98):
+    def __init__(self, dir_path, repeat=True, dtype=np.int16, chunk_size=4096, target_headroom=0.98, shuffle=False):
         gr.sync_block.__init__(self,
             name="playlist_file_source",
             in_sig=None,
@@ -47,6 +47,7 @@ class playlist_file_source(gr.sync_block):
             out_sig=[np.int16, np.int16])
         self.dir_path = dir_path
         self.repeat = repeat
+        self.shuffle = shuffle
         self.dtype = dtype
         self.chunk_size = chunk_size
         self.target_headroom = target_headroom  # 保证最大值不会爆 1.0，防削波，典型取0.98~0.99
@@ -56,6 +57,16 @@ class playlist_file_source(gr.sync_block):
         self.file_list = self._find_audio_files()
         if not self.file_list:
             raise RuntimeError(f"No audio files found in {self.dir_path}")
+        
+        # 随机播放模式：打乱文件列表
+        if self.shuffle:
+            import random
+            random.shuffle(self.file_list)
+            print(f"随机播放模式已启用，共 {len(self.file_list)} 首歌曲")
+            # 保存原始文件列表用于避免重复
+            self._played_indices = set()
+            self._original_file_list = self.file_list.copy()
+        
         self.current_file_idx = 0
         self.current_file = None
         self.current_file_path = None
@@ -183,14 +194,35 @@ class playlist_file_source(gr.sync_block):
                     pass
 
     def next_file(self):
-        self.current_file_idx += 1
-        if self.current_file_idx >= len(self.file_list):
-            if self.repeat:
-                self.current_file_idx = 0
-            else:
-                self.current_file = None
-                self._cleanup_old_temp()
-                return
+        if self.shuffle:
+            # 随机播放模式：随机选择下一首歌，避免重复播放同一首歌
+            import random
+            if len(self._played_indices) >= len(self.file_list):
+                # 所有歌曲都已播放过，重置播放记录
+                self._played_indices.clear()
+                if self.repeat:
+                    # 重新打乱列表
+                    random.shuffle(self.file_list)
+                    print("所有歌曲已播放完毕，重新打乱播放列表")
+                else:
+                    self.current_file = None
+                    self._cleanup_old_temp()
+                    return
+            
+            # 选择一个未播放过的歌曲
+            available_indices = [i for i in range(len(self.file_list)) if i not in self._played_indices]
+            self.current_file_idx = random.choice(available_indices)
+            self._played_indices.add(self.current_file_idx)
+        else:
+            # 顺序播放模式：按索引递增
+            self.current_file_idx += 1
+            if self.current_file_idx >= len(self.file_list):
+                if self.repeat:
+                    self.current_file_idx = 0
+                else:
+                    self.current_file = None
+                    self._cleanup_old_temp()
+                    return
         self.open_current_file()
 
     def work(self, input_items, output_items):
@@ -259,9 +291,10 @@ class playlist_file_source(gr.sync_block):
 
 class FM_console(gr.top_block):
 
-    def __init__(self, music_dir, freq, power):
+    def __init__(self, music_dir, freq, power, shuffle=False):
         gr.top_block.__init__(self, "FM Playlist Transmitter", catch_exceptions=True)
         self.flowgraph_started = threading.Event()
+        self.shuffle = shuffle
 
         ##################################################
         # Blocks
@@ -304,26 +337,15 @@ class FM_console(gr.top_block):
         self.osmosdr_sink_0.set_antenna('', 0)
         self.osmosdr_sink_0.set_bandwidth(0, 0)
 
-        # # [Stereo] 左声道 LPF
-        # # 调整低通滤波器，WFM 广播标准音频带宽通常为 15kHz
-        # lpf_taps = firdes.low_pass(
-        #         1,
-        #         44100,
-        #         15000,  # 5000 -> 15000 for WFM
-        #         1000,   # Widen transition for smoother rolloff
-        #         window.WIN_HAMMING,
-        #         6.76)
-
         # [Stereo] 左声道 LPF
         # 调整低通滤波器，WFM 广播标准音频带宽通常为 15kHz
         lpf_taps = firdes.low_pass(
                 1,
                 44100,
-                22050,  # 5000 -> 22050 for WFM
-                # 15000,  # 5000 -> 15000 for WFM
-                10000,   # Widen transition for smoother rolloff
+                15000,  # 5000 -> 15000 for WFM
+                1000,   # Widen transition for smoother rolloff
                 window.WIN_HAMMING,
-                99999)
+                6.76)
         
         self.low_pass_filter_left = filter.fir_filter_fff(1, lpf_taps)
         # [Stereo] 右声道 LPF
@@ -375,7 +397,7 @@ class FM_console(gr.top_block):
 
         # 使用 WFM 发送模块替换原有的 AM/IQ 注入方式 -> [Stereo] 已替换为 MPX 链
         
-        self.playlist_file_source_0 = playlist_file_source(music_dir, repeat=True, chunk_size=4096)
+        self.playlist_file_source_0 = playlist_file_source(music_dir, repeat=True, chunk_size=4096, shuffle=self.shuffle)
 
         ##################################################
         # Connections
@@ -426,9 +448,10 @@ def main(top_block_cls=FM_console, options=None):
     parser.add_argument('-d', '--dir', type=str, required=True, help="Path to directory containing WAV/MP3/FLAC/OGG files")
     parser.add_argument('-f', '--frequency', type=int, required=True, help="Transmission frequency in Hz")
     parser.add_argument('-g', '--gain', type=int, required=True, help="Transmission power in dB")
+    parser.add_argument('-s', '--shuffle', action='store_true', help="Enable shuffle mode for random playback")
     args = parser.parse_args()
 
-    tb = top_block_cls(music_dir=args.dir, freq=args.frequency, power=args.gain)
+    tb = top_block_cls(music_dir=args.dir, freq=args.frequency, power=args.gain, shuffle=args.shuffle)
 
     def sig_handler(sig=None, frame=None):
         tb.stop()
